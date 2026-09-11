@@ -13,6 +13,8 @@
 #include "sway/output.h"
 #include "sway/server.h"
 #include "sway/scene_descriptor.h"
+#include "sway/tree/arrange.h"
+#include "sway/tree/root.h"
 #include "sway/tree/view.h"
 #include "sway/tree/workspace.h"
 #include "log.h"
@@ -599,6 +601,100 @@ static void check_focus_follows_mouse(struct sway_seat *seat,
 	}
 }
 
+static void label_slide_update(void *data) {
+	struct sway_container *con = data;
+	con->label_state.slide_x = get_animated_value(con->label_state.slide_from_x,
+			con->label_state.slide_to_x, &con->label_state.slide_animation);
+	con->label_state.slide_y = get_animated_value(con->label_state.slide_from_y,
+			con->label_state.slide_to_y, &con->label_state.slide_animation);
+	arrange_container(con);
+	// arrange_container() only marks the node dirty — it doesn't commit a
+	// transaction. Everywhere else that's fine because arrange happens as
+	// part of a commit that's already in flight; this callback instead
+	// fires from the animation manager's own timer, entirely outside that
+	// pipeline, so without this call each tick would sit dirty and
+	// unrendered until some unrelated event happened to commit one.
+	transaction_commit_dirty();
+}
+
+static void label_slide_complete(void *data) {
+	// When animation_duration_ms == 0 (the project default), add_animation()
+	// invokes only this complete callback and never label_slide_update() at
+	// all — so slide_x/y must be snapped to their target here too, or the
+	// label would never move under default settings. When a real animation
+	// did run, get_animated_value() at progress 1.0 already equals the
+	// target, so this snap is a no-op in that case.
+	struct sway_container *con = data;
+	con->label_state.slide_x = con->label_state.slide_to_x;
+	con->label_state.slide_y = con->label_state.slide_to_y;
+	arrange_container(con);
+	transaction_commit_dirty();
+}
+
+static void check_label_avoid_cursor(struct sway_container *con,
+		void *data) {
+	double *cursor = data;
+	double cx = cursor[0], cy = cursor[1];
+
+	// container_label_active() rather than label_enabled: a labeled view in a
+	// tabbed/stacked parent is drawn as a tab strip entry, and a tab strip must
+	// not slide out from under the cursor.
+	if (!container_label_active(con, &con->current) || !con->label_avoid_cursor
+			|| !con->title_bar.tree->node.enabled) {
+		return;
+	}
+
+	int lx, ly;
+	if (!wlr_scene_node_coords(&con->title_bar.tree->node, &lx, &ly)) {
+		// An ancestor is disabled (e.g. a container on a workspace that isn't
+		// currently visible); there is nothing on screen to avoid.
+		return;
+	}
+
+	// arrange_label() bakes the current slide offset into the node position, so
+	// back it out to hit-test the label's *resting* rect. Testing the slid-away
+	// rect instead would oscillate: hover -> slide away -> no longer hovered ->
+	// slide back -> hovered again. Using the resting rect gives us hysteresis —
+	// the label stays out of the way until the cursor leaves the area it would
+	// occupy at rest.
+	lx -= (int)con->label_state.slide_x;
+	ly -= (int)con->label_state.slide_y;
+
+	int lwidth = con->title_width;
+	int lheight = container_titlebar_height();
+
+	bool hovering = cx >= lx && cx < lx + lwidth && cy >= ly && cy < ly + lheight;
+
+	double target_x = 0, target_y = 0;
+	if (hovering) {
+		// Slide the label fully out of its own height, in the direction
+		// away from its resting edge, so it clears the cursor.
+		target_y = con->label_edge == LABEL_EDGE_BOTTOM ? lheight : -lheight;
+	}
+
+	if (con->label_state.slide_to_y != target_y) {
+		if (hovering) {
+			// The spec makes a cursor-avoidance hover cancel autohide, same as
+			// regaining focus does.
+			container_label_restore_visibility(con);
+		} else {
+			container_label_rearm_autohide(con);
+		}
+
+		con->label_state.slide_from_x = con->label_state.slide_x;
+		con->label_state.slide_from_y = con->label_state.slide_y;
+		con->label_state.slide_to_x = target_x;
+		con->label_state.slide_to_y = target_y;
+		add_animation(&con->label_state.slide_animation,
+				label_slide_update, label_slide_complete);
+		// add_animation() only inserts into the animation manager's list —
+		// it never arms the shared ticking timer. That normally happens
+		// implicitly via transaction_progress() after a commit, but this
+		// call happens on the pointer-motion path, outside that pipeline.
+		start_animations();
+	}
+}
+
 static void handle_pointer_motion(struct sway_seat *seat, uint32_t time_msec) {
 	struct seatop_default_event *e = seat->seatop_data;
 	struct sway_cursor *cursor = seat->cursor;
@@ -622,8 +718,18 @@ static void handle_pointer_motion(struct sway_seat *seat, uint32_t time_msec) {
 		wlr_seat_pointer_notify_clear_focus(seat->wlr_seat);
 	}
 
-	drag_icons_update_position(seat);
+	// This is one of the hottest paths in the compositor, so only walk the tree
+	// when the avoid_cursor feature is actually in use somewhere.
+	if (container_has_label_avoid_cursor()) {
+		double cursor_pos[2] = { cursor->cursor->x, cursor->cursor->y };
+		root_for_each_container(check_label_avoid_cursor, cursor_pos);
+		// check_label_avoid_cursor() only marks nodes dirty via
+		// arrange_container(); nothing else on this path reliably commits, so
+		// the slide would otherwise sit unrendered until an unrelated event.
+		transaction_commit_dirty();
+	}
 
+	drag_icons_update_position(seat);
 	e->previous_node = node;
 }
 

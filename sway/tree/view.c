@@ -450,6 +450,10 @@ void view_autoconfigure(struct sway_view *view) {
 			y = con->pending.y + y_offset;
 			height = con->pending.height - y_offset
 				- con->pending.border_thickness * con->pending.border_bottom;
+		} else if (container_label_active(con, &con->pending)) {
+			y = con->pending.y;
+			height = con->pending.height
+				- con->pending.border_thickness * con->pending.border_bottom;
 		} else {
 			y = con->pending.y + container_titlebar_height();
 			height = con->pending.height - container_titlebar_height()

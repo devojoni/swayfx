@@ -121,6 +121,22 @@ struct sway_container *container_create(struct sway_view *view) {
 	c->shadow_enabled = config->shadow_enabled;
 	c->dim = config->default_dim_inactive;
 
+	c->label_enabled = config->label_enabled;
+	c->label_edge = config->label_edge;
+	c->label_align = config->label_align;
+	c->label_max_width = config->label_max_width;
+	c->label_max_width_percent = config->label_max_width_percent;
+	c->label_max_width_is_percent = config->label_max_width_is_percent;
+	c->label_corner_radius = config->label_corner_radius;
+	c->label_corner_radius_match_window = config->label_corner_radius_match_window;
+	c->label_autohide_ms = config->label_autohide_ms;
+	// Goes through the setter so the global avoid_cursor count stays accurate.
+	container_set_label_avoid_cursor(c, config->label_avoid_cursor);
+	c->label_state.animation = init_animation(c);
+	c->label_state.from_alpha = 1.0f;
+	c->label_state.to_alpha = 1.0f;
+	c->label_state.slide_animation = init_animation(c);
+
 	c->animation_state.animation = init_animation(c);
 	c->animation_state.from_alpha = 0.0f;
 	c->animation_state.to_alpha = 1.0f;
@@ -238,6 +254,151 @@ static void scene_shadow_set_color(struct wlr_scene_shadow *shadow,
 	wlr_scene_shadow_set_color(shadow, premultiplied);
 }
 
+// Number of containers with label_avoid_cursor enabled. The pointer motion
+// path uses this to skip its whole-tree sweep when nobody uses the feature.
+static int label_avoid_cursor_count = 0;
+
+void container_set_label_avoid_cursor(struct sway_container *con, bool enable) {
+	if (con->label_avoid_cursor == enable) {
+		return;
+	}
+	con->label_avoid_cursor = enable;
+	label_avoid_cursor_count += enable ? 1 : -1;
+}
+
+bool container_has_label_avoid_cursor(void) {
+	return label_avoid_cursor_count > 0;
+}
+
+bool container_label_active(struct sway_container *con,
+		struct sway_container_state *state) {
+	if (!sway_assert(state == &con->pending || state == &con->current,
+			"container_label_active() needs a container's own state")) {
+		return false;
+	}
+
+	// v1 scope: the label overlay only replaces a leaf view's own title bar. A
+	// labeled view inside a tabbed or stacked parent is drawn as an entry in
+	// that parent's tab strip instead, and must keep the regular tab strip
+	// geometry, corners and opacity.
+	if (!con->label_enabled || !con->view) {
+		return false;
+	}
+
+	// Floating containers are never part of a tab strip, regardless of the
+	// workspace layout. Check floating status in the appropriate state layer
+	// before falling back to the workspace layout check.
+	bool pending = state == &con->pending;
+	if (pending ? container_is_floating(con) : container_is_current_floating(con)) {
+		return true;
+	}
+
+	// Read the parent layout from the same state layer the caller is working
+	// with: view_autoconfigure() runs against pending state before the
+	// transaction commits, arrange/update run against current state after it.
+	enum sway_container_layout layout = L_NONE;
+	if (state->parent) {
+		layout = pending ? state->parent->pending.layout
+			: state->parent->current.layout;
+	} else if (state->workspace) {
+		layout = pending ? state->workspace->layout
+			: state->workspace->current.layout;
+	}
+
+	return layout != L_TABBED && layout != L_STACKED;
+}
+
+static void label_fade_update(void *data) {
+	struct sway_container *con = data;
+	container_update(con);
+}
+
+static void label_fade_complete(void *data) {
+	struct sway_container *con = data;
+	con->label_state.hidden = con->label_state.to_alpha == 0.0f;
+	if (con->label_state.hidden) {
+		// A fully faded out label is invisible, so it must not keep eating
+		// clicks and drags that belong to the content underneath it.
+		// arrange_label() honours label_state.hidden and leaves the node
+		// disabled until something restores visibility.
+		wlr_scene_node_set_enabled(&con->title_bar.tree->node, false);
+	}
+	container_update(con);
+}
+
+static int label_autohide_timeout(void *data) {
+	struct sway_container *con = data;
+	con->label_state.from_alpha = 1.0f;
+	con->label_state.to_alpha = 0.0f;
+	add_animation(&con->label_state.animation, label_fade_update, label_fade_complete);
+	// add_animation() only inserts into the animation manager's list — it
+	// never arms the shared ticking timer itself. Everywhere else that
+	// happens implicitly via transaction_progress() after a commit, but
+	// this timer fires completely outside that pipeline, so without this
+	// call (with animation_duration_ms > 0) the fade would sit queued and
+	// never actually tick.
+	start_animations();
+	return 0;
+}
+
+static void label_arm_autohide(struct sway_container *con) {
+	if (!con->label_state.autohide_timer) {
+		con->label_state.autohide_timer = wl_event_loop_add_timer(
+				server.wl_event_loop, label_autohide_timeout, con);
+	}
+	if (con->label_state.autohide_timer) {
+		wl_event_source_timer_update(con->label_state.autohide_timer,
+				con->label_autohide_ms);
+	}
+}
+
+void container_label_restore_visibility(struct sway_container *con) {
+	if (con->label_state.autohide_timer) {
+		wl_event_source_timer_update(con->label_state.autohide_timer, 0);
+	}
+
+	if (con->label_state.to_alpha == 1.0f) {
+		// Already visible, or already fading back in. Returning early here is
+		// what makes this function safe to call from container_update(): with
+		// animation_duration_ms == 0, add_animation() below runs
+		// label_fade_complete() synchronously, which calls container_update(),
+		// which can call back into here — but to_alpha is 1.0f by then.
+		return;
+	}
+
+	con->label_state.from_alpha = get_animated_value(con->label_state.from_alpha,
+			con->label_state.to_alpha, &con->label_state.animation);
+	con->label_state.to_alpha = 1.0f;
+	con->label_state.hidden = false;
+	if (container_label_active(con, &con->current)) {
+		// A completed fade-out disabled the node; re-enable it now so the fade
+		// back in is actually visible instead of appearing only on the next
+		// arrange.
+		wlr_scene_node_set_enabled(&con->title_bar.tree->node, true);
+	}
+	add_animation(&con->label_state.animation, label_fade_update, label_fade_complete);
+	start_animations(); // see label_autohide_timeout() for why this is needed
+
+	if (con->label_state.autohide_timer) {
+		// The nested container_update() above may have re-armed the timer;
+		// make sure we end up disarmed either way.
+		wl_event_source_timer_update(con->label_state.autohide_timer, 0);
+	}
+}
+
+void container_label_rearm_autohide(struct sway_container *con) {
+	if (!con->label_enabled || con->label_autohide_ms <= 0) {
+		return;
+	}
+	// Autohide now runs while focused (hide-after-N-ms-of-focus, not
+	// hide-after-unfocus) — only resume the countdown if we're still
+	// focused; an unfocused container always stays fully visible.
+	if (!(con->current.focused || container_is_current_parent_focused(con))) {
+		return;
+	}
+	label_arm_autohide(con);
+}
+
 void container_update(struct sway_container *con) {
 	struct border_colors *colors = container_get_current_colors(con);
 	list_t *siblings = NULL;
@@ -251,6 +412,34 @@ void container_update(struct sway_container *con) {
 			con->current.workspace->animation_state.to_alpha,
 			&con->current.workspace->animation_state.animation);
 	}
+
+	bool label_active = container_label_active(con, &con->current);
+
+	if (!label_active && (con->label_state.hidden
+			|| con->label_state.to_alpha != 1.0f)) {
+		// The label isn't in play right now — the feature was turned off, or the
+		// view moved into a tab strip. Drop any autohide state so it can't come
+		// back later as a permanently invisible (but still clickable) label.
+		// An in-flight fade is left to finish harmlessly: it now animates
+		// between 1.0 and 1.0.
+		con->label_state.from_alpha = 1.0f;
+		con->label_state.to_alpha = 1.0f;
+		con->label_state.hidden = false;
+		if (con->label_state.autohide_timer) {
+			wl_event_source_timer_update(con->label_state.autohide_timer, 0);
+		}
+	}
+
+	float label_alpha = alpha;
+	if (label_active) {
+		label_alpha *= MIN(1, MAX(0, get_animated_value(con->label_state.from_alpha,
+				con->label_state.to_alpha, &con->label_state.animation)));
+	}
+	// Title/marks text is never faded for non-labeled containers: scaling it
+	// would both change long-standing behaviour (title text does not fade with
+	// container/workspace animations or the `opacity` command) and force a full
+	// cairo re-render of every title on every animation tick.
+	float text_alpha = label_active ? label_alpha : 1.0f;
 
 	if (con->current.parent) {
 		siblings = con->current.parent->current.children;
@@ -272,9 +461,9 @@ void container_update(struct sway_container *con) {
 		}
 	}
 
-	scene_rect_set_color(con->title_bar.background_left, colors->background, alpha);
-	scene_rect_set_color(con->title_bar.background_right, colors->background, alpha);
-	scene_rect_set_color(con->title_bar.border, colors->border, alpha);
+	scene_rect_set_color(con->title_bar.background_left, colors->background, label_alpha);
+	scene_rect_set_color(con->title_bar.background_right, colors->background, label_alpha);
+	scene_rect_set_color(con->title_bar.border, colors->border, label_alpha);
 
 	if (con->view) {
 		scene_rect_set_color(con->border.top, colors->child_border, alpha);
@@ -288,13 +477,21 @@ void container_update(struct sway_container *con) {
 	}
 
 	if (con->title_bar.title_text) {
-		sway_text_node_set_color(con->title_bar.title_text, colors->text);
-		sway_text_node_set_background(con->title_bar.title_text, colors->background);
+		float text_color[4] = { colors->text[0], colors->text[1],
+			colors->text[2], colors->text[3] * text_alpha };
+		float bg_color[4] = { colors->background[0], colors->background[1],
+			colors->background[2], colors->background[3] * text_alpha };
+		sway_text_node_set_color(con->title_bar.title_text, text_color);
+		sway_text_node_set_background(con->title_bar.title_text, bg_color);
 	}
 
 	if (con->title_bar.marks_text) {
-		sway_text_node_set_color(con->title_bar.marks_text, colors->text);
-		sway_text_node_set_background(con->title_bar.marks_text, colors->background);
+		float text_color[4] = { colors->text[0], colors->text[1],
+			colors->text[2], colors->text[3] * text_alpha };
+		float bg_color[4] = { colors->background[0], colors->background[1],
+			colors->background[2], colors->background[3] * text_alpha };
+		sway_text_node_set_color(con->title_bar.marks_text, text_color);
+		sway_text_node_set_background(con->title_bar.marks_text, bg_color);
 	}
 
 	if (con->dim_rect) {
@@ -306,6 +503,23 @@ void container_update(struct sway_container *con) {
 		}
 		// Focused
 		bool focused = con->current.focused || container_is_current_parent_focused(con);
+
+		if (label_active && con->label_autohide_ms > 0) {
+			if (!con->label_state.was_focused && focused) {
+				// Just gained focus: show it, then start the
+				// hide-after-N-ms countdown. This fires regardless of
+				// whether the container stays focused afterward —
+				// autohide is not tied to keyboard/mouse activity.
+				container_label_restore_visibility(con);
+				label_arm_autohide(con);
+			} else if (con->label_state.was_focused && !focused) {
+				// Lost focus: cancel any pending/in-flight hide and
+				// restore full visibility. An unfocused label is never
+				// left faded.
+				container_label_restore_visibility(con);
+			}
+		}
+		con->label_state.was_focused = focused;
 
 		scene_rect_set_color(con->dim_rect, color, focused ? 0.0 : con->dim);
 	}
@@ -320,6 +534,16 @@ void container_update_itself_and_parents(struct sway_container *con) {
 }
 
 static struct fx_corner_radii get_titlebar_corners(struct sway_container *con) {
+	if (container_label_active(con, &con->current)) {
+		// A floating label is rounded on all four corners; a tab strip entry
+		// (which a labeled view still gets when it lives in a tabbed/stacked
+		// parent) must keep the regular corner-cut logic below.
+		int radius = con->label_corner_radius_match_window
+			? con->corner_radius
+			: con->label_corner_radius;
+		return corner_radii_all(MAX(radius, 0));
+	}
+
 	int radius = container_has_corner_radius(con) ? con->corner_radius +
 		con->current.border_thickness - config->titlebar_border_thickness : 0;
 	struct fx_corner_radii corners = corner_radii_top(radius);
@@ -571,6 +795,22 @@ void container_destroy(struct sway_container *con) {
 	if (con->animation_state.animation.initialized) {
 		finish_animation(&con->animation_state.animation);
 	}
+
+	if (con->label_state.animation.initialized) {
+		finish_animation(&con->label_state.animation);
+	}
+
+	if (con->label_state.slide_animation.initialized) {
+		finish_animation(&con->label_state.slide_animation);
+	}
+
+	if (con->label_state.autohide_timer) {
+		wl_event_source_remove(con->label_state.autohide_timer);
+	}
+
+	// Keep the global avoid_cursor count from drifting when a container that
+	// had it enabled is closed without the setting being turned off first.
+	container_set_label_avoid_cursor(con, false);
 
 	free(con->title);
 	free(con->formatted_title);
@@ -1152,7 +1392,14 @@ void container_set_geometry_from_content(struct sway_container *con) {
 
 	if (con->pending.border != B_CSD && !con->pending.fullscreen_mode) {
 		border_width = con->pending.border_thickness * (con->pending.border != B_NONE);
-		top = con->pending.border == B_NORMAL ?
+		// A label floats over content instead of reserving titlebar height
+		// (matching view_autoconfigure()'s content-box computation) — must
+		// stay in sync with that function or floating windows whose client
+		// renegotiates size on every commit (observed with GTK apps, not
+		// terminals) grow without bound: this function would keep adding
+		// container_titlebar_height() back on top of a content_height that
+		// view_autoconfigure() never subtracted it from in the first place.
+		top = (con->pending.border == B_NORMAL && !container_label_active(con, &con->pending)) ?
 			container_titlebar_height() : border_width;
 	}
 
