@@ -796,21 +796,10 @@ void container_destroy(struct sway_container *con) {
 		finish_animation(&con->animation_state.animation);
 	}
 
-	if (con->label_state.animation.initialized) {
-		finish_animation(&con->label_state.animation);
-	}
-
-	if (con->label_state.slide_animation.initialized) {
-		finish_animation(&con->label_state.slide_animation);
-	}
-
-	if (con->label_state.autohide_timer) {
-		wl_event_source_remove(con->label_state.autohide_timer);
-	}
-
-	// Keep the global avoid_cursor count from drifting when a container that
-	// had it enabled is closed without the setting being turned off first.
-	container_set_label_avoid_cursor(con, false);
+	// Label animation/timer/counter cleanup happens earlier, in
+	// container_begin_destroy() — see the comment there for why it must
+	// not happen here (this function's call can be reentrant into
+	// animation_timer()'s own list iteration).
 
 	free(con->title);
 	free(con->formatted_title);
@@ -851,6 +840,29 @@ void container_begin_destroy(struct sway_container *con) {
 
 	node_set_dirty(&con->node);
 	con->node.destroying = true;
+
+	// Finish the label animations here, at the moment the close is
+	// initiated (a normal, non-reentrant call stack), NOT later in
+	// container_destroy(). That function's final call can happen from
+	// INSIDE animation_timer()'s own iteration — the close pop-out
+	// animation's complete callback is what ultimately triggers it — and
+	// wl_list_for_each_reverse_safe only protects the node currently being
+	// iterated, not arbitrary other nodes. Removing this container's label
+	// animations from the same shared list at that point can dangle the
+	// iterator's precomputed "next" pointer if either happened to be it,
+	// segfaulting the whole compositor. Finishing them early avoids ever
+	// touching the list reentrantly for this container.
+	if (con->label_state.animation.initialized) {
+		finish_animation(&con->label_state.animation);
+	}
+	if (con->label_state.slide_animation.initialized) {
+		finish_animation(&con->label_state.slide_animation);
+	}
+	if (con->label_state.autohide_timer) {
+		wl_event_source_remove(con->label_state.autohide_timer);
+		con->label_state.autohide_timer = NULL;
+	}
+	container_set_label_avoid_cursor(con, false);
 
 	if (con->scratchpad) {
 		root_scratchpad_remove_container(con);
@@ -2280,4 +2292,3 @@ bool container_has_corner_radius(struct sway_container *con) {
 			!(config->smart_corner_radius && con->current.workspace->current_gaps.top == 0)) &&
 			con->corner_radius;
 }
-

@@ -452,6 +452,8 @@ static void arrange_label(struct sway_container *con,
 	// container_label_restore_visibility() own that flag.
 	wlr_scene_node_set_enabled(&con->title_bar.tree->node,
 			!con->label_state.hidden);
+	con->label_state.rest_x = x;
+	con->label_state.rest_y = y;
 	wlr_scene_node_set_position(&con->title_bar.tree->node,
 			x + (int)con->label_state.slide_x, y + (int)con->label_state.slide_y);
 

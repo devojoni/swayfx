@@ -187,6 +187,7 @@ struct sway_container {
 		double slide_from_x, slide_from_y;
 		double slide_to_x, slide_to_y;
 		double slide_x, slide_y;
+		int rest_x, rest_y;
 	} label_state;
 
 	struct {

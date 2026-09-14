@@ -601,34 +601,26 @@ static void check_focus_follows_mouse(struct sway_seat *seat,
 	}
 }
 
+static void label_reposition_from_slide(struct sway_container *con) {
+	wlr_scene_node_set_position(&con->title_bar.tree->node,
+			con->label_state.rest_x + (int)con->label_state.slide_x,
+			con->label_state.rest_y + (int)con->label_state.slide_y);
+}
+
 static void label_slide_update(void *data) {
 	struct sway_container *con = data;
 	con->label_state.slide_x = get_animated_value(con->label_state.slide_from_x,
 			con->label_state.slide_to_x, &con->label_state.slide_animation);
 	con->label_state.slide_y = get_animated_value(con->label_state.slide_from_y,
 			con->label_state.slide_to_y, &con->label_state.slide_animation);
-	arrange_container(con);
-	// arrange_container() only marks the node dirty — it doesn't commit a
-	// transaction. Everywhere else that's fine because arrange happens as
-	// part of a commit that's already in flight; this callback instead
-	// fires from the animation manager's own timer, entirely outside that
-	// pipeline, so without this call each tick would sit dirty and
-	// unrendered until some unrelated event happened to commit one.
-	transaction_commit_dirty();
+	label_reposition_from_slide(con);
 }
 
 static void label_slide_complete(void *data) {
-	// When animation_duration_ms == 0 (the project default), add_animation()
-	// invokes only this complete callback and never label_slide_update() at
-	// all — so slide_x/y must be snapped to their target here too, or the
-	// label would never move under default settings. When a real animation
-	// did run, get_animated_value() at progress 1.0 already equals the
-	// target, so this snap is a no-op in that case.
 	struct sway_container *con = data;
 	con->label_state.slide_x = con->label_state.slide_to_x;
 	con->label_state.slide_y = con->label_state.slide_to_y;
-	arrange_container(con);
-	transaction_commit_dirty();
+	label_reposition_from_slide(con);
 }
 
 static void check_label_avoid_cursor(struct sway_container *con,
@@ -651,12 +643,6 @@ static void check_label_avoid_cursor(struct sway_container *con,
 		return;
 	}
 
-	// arrange_label() bakes the current slide offset into the node position, so
-	// back it out to hit-test the label's *resting* rect. Testing the slid-away
-	// rect instead would oscillate: hover -> slide away -> no longer hovered ->
-	// slide back -> hovered again. Using the resting rect gives us hysteresis —
-	// the label stays out of the way until the cursor leaves the area it would
-	// occupy at rest.
 	lx -= (int)con->label_state.slide_x;
 	ly -= (int)con->label_state.slide_y;
 
@@ -687,10 +673,6 @@ static void check_label_avoid_cursor(struct sway_container *con,
 		con->label_state.slide_to_y = target_y;
 		add_animation(&con->label_state.slide_animation,
 				label_slide_update, label_slide_complete);
-		// add_animation() only inserts into the animation manager's list —
-		// it never arms the shared ticking timer. That normally happens
-		// implicitly via transaction_progress() after a commit, but this
-		// call happens on the pointer-motion path, outside that pipeline.
 		start_animations();
 	}
 }
@@ -723,10 +705,6 @@ static void handle_pointer_motion(struct sway_seat *seat, uint32_t time_msec) {
 	if (container_has_label_avoid_cursor()) {
 		double cursor_pos[2] = { cursor->cursor->x, cursor->cursor->y };
 		root_for_each_container(check_label_avoid_cursor, cursor_pos);
-		// check_label_avoid_cursor() only marks nodes dirty via
-		// arrange_container(); nothing else on this path reliably commits, so
-		// the slide would otherwise sit unrendered until an unrelated event.
-		transaction_commit_dirty();
 	}
 
 	drag_icons_update_position(seat);
