@@ -362,6 +362,9 @@ static void label_arm_autohide(struct sway_container *con) {
 }
 
 void container_label_restore_visibility(struct sway_container *con) {
+	if (con->node.destroying) {
+		return;
+	}
 	if (con->label_state.autohide_timer) {
 		wl_event_source_timer_update(con->label_state.autohide_timer, 0);
 	}

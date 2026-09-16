@@ -628,13 +628,8 @@ static void check_label_avoid_cursor(struct sway_container *con,
 	double *cursor = data;
 	double cx = cursor[0], cy = cursor[1];
 
-	// Cheapest check first — this runs for every container in the tree on
-	// every pointer motion event when the feature is enabled anywhere, and
-	// label_avoid_cursor is false for the overwhelming majority of them.
-	// container_label_active() rather than label_enabled: a labeled view in a
-	// tabbed/stacked parent is drawn as a tab strip entry, and a tab strip must
-	// not slide out from under the cursor.
-	if (!con->label_avoid_cursor || !container_label_active(con, &con->current)
+	if (con->node.destroying || !con->label_avoid_cursor
+			|| !container_label_active(con, &con->current)
 			|| !con->title_bar.tree->node.enabled) {
 		return;
 	}
