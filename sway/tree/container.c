@@ -342,6 +342,15 @@ static int label_autohide_timeout(void *data) {
 }
 
 static void label_arm_autohide(struct sway_container *con) {
+	// container_begin_destroy() already removed and NULLed this timer for
+	// good — never recreate it on a container that's going away. Without
+	// this guard, a focus-transition edge observed during the close/pop-out
+	// animation (which keeps calling container_update() on a still-valid
+	// but destroying container) could create a brand-new wl_event_source
+	// with nothing left to ever clean it up, firing later on freed memory.
+	if (con->node.destroying) {
+		return;
+	}
 	if (!con->label_state.autohide_timer) {
 		con->label_state.autohide_timer = wl_event_loop_add_timer(
 				server.wl_event_loop, label_autohide_timeout, con);
@@ -538,8 +547,12 @@ static struct fx_corner_radii get_titlebar_corners(struct sway_container *con) {
 		// A floating label is rounded on all four corners; a tab strip entry
 		// (which a labeled view still gets when it lives in a tabbed/stacked
 		// parent) must keep the regular corner-cut logic below.
+		// "match" must respect the same has-radius-at-all gate (including
+		// smart_corner_radius suppression at zero gaps) that the window's
+		// own corners use below — otherwise the label stays visibly rounded
+		// while the window it's supposedly matching goes square.
 		int radius = con->label_corner_radius_match_window
-			? con->corner_radius
+			? (container_has_corner_radius(con) ? con->corner_radius : 0)
 			: con->label_corner_radius;
 		return corner_radii_all(MAX(radius, 0));
 	}

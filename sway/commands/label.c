@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "sway/commands.h"
@@ -16,6 +17,18 @@ static struct cmd_results *label_cmd_enable(struct sway_container *container,
 	} else {
 		return cmd_results_new(CMD_INVALID,
 				"Expected 'label enable|disable|toggle'");
+	}
+
+	// Autohide arms on a focus-GAIN edge (was_focused: false -> true) —
+	// container_update() already tracks was_focused continuously,
+	// regardless of label_enabled, so enabling the label on a window
+	// that's already focused sees no such edge and would otherwise never
+	// start the countdown until an actual focus loss/regain cycle. Arm it
+	// here explicitly for that case (a no-op via its own guards if the
+	// container isn't focused, autohide is off, or label ended up
+	// disabled).
+	if (container->label_enabled) {
+		container_label_rearm_autohide(container);
 	}
 	return NULL;
 }
@@ -51,7 +64,11 @@ static bool parse_label_max_width(const char *arg, int *px, float *percent,
 		bool *is_percent) {
 	char *end;
 	float value = strtof(arg, &end);
-	if (end == arg || value < 0) {
+	// strtof() happily parses "inf"/"nan" (case-insensitively, with an
+	// optional sign) and neither compares less than 0, so `value < 0`
+	// alone lets them through; casting a non-finite float to int below is
+	// undefined behavior.
+	if (end == arg || !isfinite(value) || value < 0) {
 		return false;
 	}
 	if (*end == '%' && *(end + 1) == '\0') {
@@ -100,9 +117,11 @@ static struct cmd_results *label_cmd_corner_radius(struct sway_container *contai
 		container->label_corner_radius_match_window = true;
 		return NULL;
 	}
-	char *end;
-	int value = strtol(argv[1], &end, 10);
-	if (*end != '\0' || value < 0 || value > 99) {
+	int value;
+	// Reuse the window corner_radius command's own parser/range (0-99)
+	// rather than duplicating it — a future change to the accepted range
+	// would otherwise only apply to one of the two commands.
+	if (!cmd_corner_radius_parse_value(argv[1], &value)) {
 		return cmd_results_new(CMD_INVALID,
 				"Invalid corner_radius value '%s' (expected 0-99 or 'match')",
 				argv[1]);
@@ -120,16 +139,24 @@ static struct cmd_results *label_cmd_autohide(struct sway_container *container,
 	}
 	if (strcmp(argv[1], "off") == 0) {
 		container->label_autohide_ms = 0;
-		return NULL;
+	} else {
+		char *end;
+		int value = strtol(argv[1], &end, 10);
+		if (*end != '\0' || value < 0) {
+			return cmd_results_new(CMD_INVALID,
+					"Invalid autohide value '%s' (expected 'off' or a positive number of ms)",
+					argv[1]);
+		}
+		container->label_autohide_ms = value;
 	}
-	char *end;
-	int value = strtol(argv[1], &end, 10);
-	if (*end != '\0' || value < 0) {
-		return cmd_results_new(CMD_INVALID,
-				"Invalid autohide value '%s' (expected 'off' or a positive number of ms)",
-				argv[1]);
-	}
-	container->label_autohide_ms = value;
+
+	// Re-sync any in-flight timer/fade to the new setting immediately —
+	// otherwise a countdown already running against the OLD value keeps
+	// firing (or not firing) on its own schedule regardless of what was
+	// just configured. Cancel + restore first, then re-arm fresh only if
+	// the new setting and current focus state actually call for it.
+	container_label_restore_visibility(container);
+	container_label_rearm_autohide(container);
 	return NULL;
 }
 
